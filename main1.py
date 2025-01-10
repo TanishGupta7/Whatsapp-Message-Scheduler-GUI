@@ -10,7 +10,10 @@ from tkinter import ttk, messagebox, filedialog
 from ttkbootstrap import Style
 import threading
 import pyautogui
+import logging
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # Browser paths (update these if your browser is installed in a different location)
 BROWSER_PATHS = {
@@ -25,7 +28,6 @@ BROWSER_PATHS = {
         "C:/Program Files/Mozilla Firefox/firefox.exe",
     ],
 }
-
 
 # Multi-language support
 LANGUAGES = {
@@ -94,13 +96,11 @@ LANGUAGES = {
     },
 }
 
-
 def validate_phone_number(phone):
     """Validate the phone number."""
     if not re.match(r"^\+[1-9]\d{1,14}$", phone):
         return False
     return True
-
 
 def validate_time(hour, minute):
     """Validate the time input."""
@@ -109,7 +109,6 @@ def validate_time(hour, minute):
     if scheduled_time < now:
         return False
     return True
-
 
 def check_browser_installed(browser):
     """Check if the selected browser is installed."""
@@ -120,7 +119,6 @@ def check_browser_installed(browser):
             return True
     return False
 
-
 def register_browser(browser):
     """Register the browser with webbrowser."""
     for path in BROWSER_PATHS.get(browser, []):
@@ -128,7 +126,6 @@ def register_browser(browser):
             webbrowser.register(browser, None, webbrowser.BackgroundBrowser(path))
             return True
     return False
-
 
 def send_whatsapp_message(phone, message, hour, minute, attachments=None, browser=None):
     """Send a WhatsApp message with optional attachments."""
@@ -151,23 +148,28 @@ def send_whatsapp_message(phone, message, hour, minute, attachments=None, browse
             # Attach files (if any)
             if attachments:
                 for file in attachments:
-                    # Click the attachment button
-                    pyautogui.click(x=100, y=100)  # Replace with the actual coordinates of the attachment button
-                    time.sleep(1)
-                    # Type the file path and press Enter
-                    pyautogui.write(file)
-                    pyautogui.press("enter")
-                    time.sleep(2)  # Wait for the file to upload
+                    # Locate the attachment button using image recognition
+                    try:
+                        attachment_button = pyautogui.locateOnScreen("attachment_button.png", confidence=0.8)
+                        if attachment_button:
+                            pyautogui.click(attachment_button)
+                            time.sleep(1)
+                            pyautogui.write(file)
+                            pyautogui.press("enter")
+                            time.sleep(2)  # Wait for the file to upload
+                        else:
+                            logging.error("Attachment button not found.")
+                    except Exception as e:
+                        logging.error(f"Error locating attachment button: {e}")
         else:
             # Use pywhatkit to send the message
             pyw.sendwhatmsg(phone, message, hour, minute)
 
-        print(f"Message sent to {phone} at {hour}:{minute}.")
+        logging.info(f"Message sent to {phone} at {hour}:{minute}.")
         return True
     except Exception as e:
-        print(f"An error occurred: {e}")
+        logging.error(f"An error occurred: {e}")
         return False
-
 
 class WhatsAppApp:
     def __init__(self, root):
@@ -186,6 +188,7 @@ class WhatsAppApp:
         self.template_var = tk.StringVar(value="Custom")
         self.attachments = []
         self.scheduled_messages = []
+        self.active_threads = {}  # Track active threads using a dictionary
 
         # Create UI
         self.create_widgets()
@@ -288,7 +291,9 @@ class WhatsAppApp:
             return
 
         # Add the message to the scheduled messages list
+        message_id = f"{phone}_{hour}:{minute}"
         self.scheduled_messages.append({
+            "id": message_id,
             "phone": phone,
             "message": message,
             "time": f"{hour}:{minute}",
@@ -304,15 +309,18 @@ class WhatsAppApp:
         self.attachment_label.config(text=LANGUAGES[self.language]["no_files_selected"], foreground="gray")
 
         # Schedule the message
-        threading.Thread(
+        stop_event = threading.Event()
+        thread = threading.Thread(
             target=self.send_message_later,
-            args=(phone, message, hour, minute, self.attachments, browser),
+            args=(message_id, phone, message, hour, minute, self.attachments, browser, stop_event),
             daemon=True
-        ).start()
+        )
+        self.active_threads[message_id] = (thread, stop_event)
+        thread.start()
 
         messagebox.showinfo(LANGUAGES[self.language]["success"], LANGUAGES[self.language]["scheduled_success"])
 
-    def send_message_later(self, phone, message, hour, minute, attachments, browser):
+    def send_message_later(self, message_id, phone, message, hour, minute, attachments, browser, stop_event):
         """Send the message at the scheduled time."""
         now = datetime.now()
         scheduled_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -321,11 +329,16 @@ class WhatsAppApp:
         if delay > 0:
             time.sleep(delay)  # Wait until the scheduled time
 
-        success = send_whatsapp_message(phone, message, hour, minute, attachments, browser)
-        if success:
-            messagebox.showinfo(LANGUAGES[self.language]["success"], LANGUAGES[self.language]["sent_success"])
-        else:
-            messagebox.showerror(LANGUAGES[self.language]["error"], LANGUAGES[self.language]["send_failed"])
+        if not stop_event.is_set():
+            success = send_whatsapp_message(phone, message, hour, minute, attachments, browser)
+            if success:
+                messagebox.showinfo(LANGUAGES[self.language]["success"], LANGUAGES[self.language]["sent_success"])
+            else:
+                messagebox.showerror(LANGUAGES[self.language]["error"], LANGUAGES[self.language]["send_failed"])
+
+        # Remove the thread from active threads
+        if message_id in self.active_threads:
+            del self.active_threads[message_id]
 
     def view_scheduled_messages(self):
         """Display all scheduled messages in a new window."""
@@ -348,7 +361,19 @@ class WhatsAppApp:
             messagebox.showerror(LANGUAGES[self.language]["error"], "No scheduled messages to edit.")
             return
 
+        # Access the message before removing it
         msg = self.scheduled_messages[index]
+
+        # Stop the thread for the old message
+        if msg["id"] in self.active_threads:
+            thread, stop_event = self.active_threads[msg["id"]]
+            stop_event.set()
+            del self.active_threads[msg["id"]]
+
+        # Remove the old scheduled message
+        self.scheduled_messages.pop(index)
+
+        # Populate the input fields with the selected message
         self.phone_var.set(msg["phone"])
         self.message_var.set(msg["message"])
         self.hour_var.set(int(msg["time"].split(":")[0]))
@@ -356,18 +381,22 @@ class WhatsAppApp:
         self.attachments = msg["attachments"]
         self.attachment_label.config(text=f"{len(msg['attachments'])} file(s) selected", foreground="black")
 
-        # Remove the message from the scheduled list
-        self.scheduled_messages.pop(index)
-
     def delete_scheduled_message(self, index):
         """Delete a scheduled message."""
         if not self.scheduled_messages:
             messagebox.showerror(LANGUAGES[self.language]["error"], "No scheduled messages to delete.")
             return
 
+        # Stop the thread for the deleted message
+        msg = self.scheduled_messages[index]
+        if msg["id"] in self.active_threads:
+            thread, stop_event = self.active_threads[msg["id"]]
+            stop_event.set()
+            del self.active_threads[msg["id"]]
+
+        # Remove the message from the list
         self.scheduled_messages.pop(index)
         messagebox.showinfo(LANGUAGES[self.language]["success"], "Scheduled message deleted.")
-
 
 if __name__ == "__main__":
     root = tk.Tk()
